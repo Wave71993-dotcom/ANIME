@@ -1,7 +1,3 @@
-Ah, I understand! You want the raw code block so you can just hit the **"Copy code"** button and paste it directly into your `README.md` file on GitHub without the text rendering weirdly.
-
-Here is the exact raw markdown:
-
 ```markdown
 ━━━━━━━━━━━━━━━━━━━━
 
