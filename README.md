@@ -1,6 +1,6 @@
 # ╔════════════════════════════════════╗
 
-# ║   AUTO ANIME PAHE — ADVANCED BOT   ║
+# ║   ANIME PAHE — ADVANCED BOT   ║
 
 # ╚════════════════════════════════════╝
 
@@ -12,12 +12,10 @@
 
 ## ▣ OVERVIEW
 
-Auto Anime Pahe is a high-performance Telegram bot built for automated anime downloading, processing, and uploading.
+Anime Pahe is a high-performance Telegram bot built for automated anime downloading, processing, and uploading.
 
 Runs on:
 
-* Koyeb
-* Render
 * VPS / Dedicated
 * Local
 
@@ -146,7 +144,6 @@ BOT_USERNAME=
 CHANNEL_NAME=
 CHANNEL_USERNAME=
 DELETE_TIMER=3600
-STICKER_ID=CAACAgUAAxkBAAEQJ6hpV0JDpDDOI68yH7lV879XbIWiFwACGAADQ3PJEs4sW1y9vZX3OAQ
 MONGO_URI=
 DB_NAME=AutoAnimePahe
 FIXED_THUMBNAIL_PIC=https://i.postimg.cc/QCQgY9Xk/photo-2026-01-02-09-25-44.jpg
@@ -177,8 +174,8 @@ python main.py
 
 ```
 SUPPORTED:
-- KOYEB
-- RENDER
+x KOYEB
+x RENDER
 - VPS
 - LOCAL
 ```
@@ -190,6 +187,7 @@ SUPPORTED:
 ```
 PYTHON
 PYROGRAM
+TELETHON
 ASYNCIO
 FFMPEG
 MONGODB
