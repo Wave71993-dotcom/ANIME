@@ -180,7 +180,9 @@ async def _resolve_channel_target(client, channel_id, channel_username):
 
 async def _get_saved_media_message(client, anime_title, kind):
     try:
-        media_map = bot_settings.get(f"anime_{kind}s", {}) or {}
+        # Import locally so this helper never depends on a stale/missing module global.
+        from core.state import bot_settings as _bot_settings
+        media_map = _bot_settings.get(f"anime_{kind}s", {}) or {}
         ref = media_map.get(anime_title)
         if not ref or not ref.get("chat_id") or not ref.get("message_id"):
             return None
@@ -202,7 +204,9 @@ async def _download_saved_media_url(url, path):
     return None
 
 async def _get_anime_thumb_path(client, anime_title):
-    media_map = bot_settings.get("anime_thumbs", {}) or {}
+    # Keep media lookup independent of module-level bot_settings binding.
+    from core.state import bot_settings as _bot_settings
+    media_map = _bot_settings.get("anime_thumbs", {}) or {}
     ref = media_map.get(anime_title)
     if not ref:
         return await get_fixed_thumbnail()
