@@ -1,639 +1,750 @@
 from __future__ import annotations
+
 import os
 import re
-import ast
 import time
-import random
 import logging
 import asyncio
-import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin
 
 import requests
 import aiohttp
-import cloudscraper
-from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
-
-from core.config import HEADERS, ANILIST_API, ANIMEPAHE_BASE_URL
 
 logger = logging.getLogger(__name__)
 
-KWIK_USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
+# Hiyori / Miruro Native API.
+# This replaces the old AnimePahe/Cloudflare path while keeping the
+# function names and return shapes expected by handlers.py/scheduler.py.
+HIYORI_BASE_URL = os.environ.get(
+    "HIYORI_BASE_URL",
+    "https://api.hiyori.tv"
+).rstrip("/")
 
-# =====================================================================
-# FIX (Render deploy bug, part 1): animepahe.pw sits behind Cloudflare.
-# Plain aiohttp/requests calls (as this file used to do for the JSON
-# API endpoints below) get blocked/challenged by Cloudflare when they
-# come from a datacenter IP like Render's -- you get an HTML
-# "checking your browser" page back instead of JSON, so response.json()
-# throws and the bot shows "search error" / "failed request".
-#
-# The rest of this file (get_stream_links, extract_m3u8_from_kwik)
-# already solved this by using `cloudscraper` instead of plain
-# requests/aiohttp. This helper applies that same fix to the search,
-# episode-list, and latest-releases endpoints, which were missed.
-#
-# cloudscraper is synchronous, so from async functions we run it in a
-# worker thread via asyncio.to_thread so it doesn't block the event loop.
-# =====================================================================
-#
-# FIX (Render deploy bug, part 2): on Render, animepahe.pw returned a
-# hard 403 Forbidden -- not a JS challenge page. That means Cloudflare
-# is IP-blocking Render's whole datacenter range outright. cloudscraper
-# only solves JS/browser challenges, it cannot get past an IP-level
-# block, because Cloudflare refuses the connection before any challenge
-# is served. The only fix for that is routing requests through an IP
-# Cloudflare hasn't blocked, i.e. a proxy (ideally residential/rotating,
-# from a service like Webshare, Smartproxy, Bright Data, etc.).
-#
-# Set the environment variable ANIMEPAHE_PROXY on Render to a full
-# proxy URL, e.g.:
-#   ANIMEPAHE_PROXY=http://username:password@proxy-host:port
-# If it's not set, everything behaves exactly as before (no proxy).
-# =====================================================================
-ANIMEPAHE_PROXY = os.environ.get("ANIMEPAHE_PROXY", "").strip()
-PROXIES = {"http": ANIMEPAHE_PROXY, "https": ANIMEPAHE_PROXY} if ANIMEPAHE_PROXY else None
+HLS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/132.0.0.0 Safari/537.36"
+)
+HLS_REFERER = os.environ.get("HIYORI_HLS_REFERER", "https://megaplay.buzz/")
 
-def _new_scraper():
-    """Create a cloudscraper session, routed through ANIMEPAHE_PROXY if set."""
-    scraper = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'linux', 'mobile': False}
-    )
-    if PROXIES:
-        scraper.proxies.update(PROXIES)
-    return scraper
-
-def _cf_get_json(url: str) -> Any:
-    """Synchronous helper: GET a URL through cloudscraper (bypasses
-    Cloudflare's JS challenge, and the proxy, if set, bypasses IP
-    blocks) and return the parsed JSON body."""
-    scraper = _new_scraper()
-    scraper.headers.update(HEADERS)
-    response = scraper.get(url, timeout=30)
-    response.raise_for_status()
-    return response.json()
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": HLS_USER_AGENT,
+    "Accept": "application/json",
+})
 
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    reraise=True
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    reraise=True,
+)
+def _hiyori_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET JSON from Hiyori with a small retry policy for transient 5xx errors."""
+    url = path if path.startswith("http") else f"{HIYORI_BASE_URL}/{path.lstrip('/')}"
+    response = _session.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"Unexpected Hiyori response type: {type(data).__name__}")
+    return data
+
+
+def _title_text(item: Dict[str, Any]) -> str:
+    title = item.get("title") or item.get("name") or "Unknown Anime"
+    if isinstance(title, dict):
+        return (
+            title.get("english")
+            or title.get("romaji")
+            or title.get("native")
+            or "Unknown Anime"
+        )
+    return str(title)
+
+
+def _year_value(item: Dict[str, Any]) -> int:
+    value = item.get("year")
+    if value is None:
+        value = item.get("seasonYear")
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _episode_value(item: Dict[str, Any]) -> int:
+    """Extract a released/current episode number from several Hiyori shapes."""
+    for key in ("episode", "latestEpisode", "latest_episode", "currentEpisode", "current_episode"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            value = value.get("episode") or value.get("number")
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+
+    # /schedule exposes next_episode + timeUntilAiring. If it is in the
+    # future, the most recently released episode is normally next - 1.
+    try:
+        nxt = int(item.get("next_episode") or item.get("nextEpisode") or 0)
+        remaining = float(item.get("timeUntilAiring") or item.get("time_until_airing") or 0)
+        if nxt > 0:
+            return max(nxt - 1, 0) if remaining > 0 else nxt
+    except (TypeError, ValueError):
+        pass
+
+    # Last fallback: some collection responses expose an episode count.
+    try:
+        return int(item.get("episodes") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_anime(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the old AnimePahe-compatible anime shape used by the bot."""
+    anilist_id = item.get("id") or item.get("anilistId") or item.get("anilist_id")
+    title = _title_text(item)
+    year = _year_value(item)
+    episodes = item.get("episodes")
+
+    if isinstance(episodes, dict):
+        episodes = episodes.get("released") or episodes.get("total")
+
+    try:
+        episodes = int(episodes or 0)
+    except (TypeError, ValueError):
+        episodes = 0
+
+    return {
+        "id": anilist_id,
+        "session": str(anilist_id) if anilist_id is not None else "",
+        "title": title,
+        "year": year,
+        "episodes": episodes,
+        "poster": item.get("poster") or item.get("coverImage"),
+        "format": item.get("format"),
+        "status": item.get("status"),
+    }
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    reraise=True,
 )
 async def search_anime(query: str) -> Optional[List[Dict[str, Any]]]:
-    # CHANGED: uses ANIMEPAHE_BASE_URL instead of a hardcoded domain, so
-    # this can be pointed at a Cloudflare Worker proxy (see config.py)
-    # to route around Render's IP being blocked.
-    search_url = f"{ANIMEPAHE_BASE_URL}/api?m=search&q={quote(query)}"
+    """Search Hiyori and return the old bot-compatible result shape."""
+    data = await asyncio.to_thread(
+        _hiyori_get_json,
+        "/suggestions",
+        {"query": query},
+    )
 
-    # CHANGED: was a raw aiohttp.ClientSession() request, which Cloudflare
-    # blocked on Render. Now routed through cloudscraper (in a thread).
-    data = await asyncio.to_thread(_cf_get_json, search_url)
-
-    if data.get('total', 0) == 0:
+    results = data.get("suggestions") or data.get("results") or data.get("data") or []
+    if not isinstance(results, list):
         return None
 
-    return data.get('data', [])
+    normalized = []
+    for item in results:
+        if isinstance(item, dict) and item.get("id") is not None:
+            normalized.append(_normalize_anime(item))
+
+    return normalized or None
+
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    reraise=True
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    reraise=True,
 )
 async def get_episode_list(session_id: str, page: int = 1) -> Dict[str, Any]:
-    # CHANGED: uses ANIMEPAHE_BASE_URL instead of a hardcoded domain.
-    episodes_url = f"{ANIMEPAHE_BASE_URL}/api?m=release&id={session_id}&sort=episode_asc&page={page}"
+    """
+    Hiyori episode list -> old AnimePahe-compatible shape.
 
-    # CHANGED: was a raw aiohttp.ClientSession() request, same Cloudflare
-    # issue as search_anime above. Now routed through cloudscraper.
-    return await asyncio.to_thread(_cf_get_json, episodes_url)
+    session_id is the AniList ID returned by search_anime().
+    One row is created per episode number. get_stream_links() later
+    resolves the actual SUB/DUB provider IDs for that episode.
+    """
+    anilist_id = str(session_id).strip()
+    data = await asyncio.to_thread(_hiyori_get_json, f"/episodes/{anilist_id}")
 
-def get_latest_releases(page=1):
-    # CHANGED: uses ANIMEPAHE_BASE_URL instead of a hardcoded domain.
-    releases_url = f"{ANIMEPAHE_BASE_URL}/api?m=airing&page={page}"
+    providers = data.get("providers") or {}
+    by_number: Dict[int, Dict[str, Any]] = {}
 
-    # CHANGED: was `requests.get(...)`, blocked by Cloudflare on Render
-    # (this is why /latest and /airing showed no results either).
-    # Now uses cloudscraper directly (this function is already sync,
-    # so no asyncio.to_thread wrapper is needed here).
-    return _cf_get_json(releases_url)
+    if isinstance(providers, dict):
+        for provider_name, provider_data in providers.items():
+            if not isinstance(provider_data, dict):
+                continue
+
+            groups = provider_data.get("episodes") or {}
+            if not isinstance(groups, dict):
+                continue
+
+            for language in ("sub", "dub"):
+                episode_list = groups.get(language) or []
+                if not isinstance(episode_list, list):
+                    continue
+
+                for ep in episode_list:
+                    if not isinstance(ep, dict):
+                        continue
+                    try:
+                        number = int(ep.get("number"))
+                    except (TypeError, ValueError):
+                        continue
+
+                    if number not in by_number:
+                        by_number[number] = {
+                            "episode": number,
+                            # Synthetic ID; no provider is hard-coded here.
+                            "session": f"hiyori:{anilist_id}:{number}",
+                            "title": ep.get("title") or f"Episode {number}",
+                            "image": ep.get("image"),
+                            "airDate": ep.get("airDate"),
+                        }
+
+    episodes = [by_number[n] for n in sorted(by_number)]
+    return {
+        "data": episodes,
+        "last_page": 1,
+        "total": len(episodes),
+    }
 
 
-async def get_all_episodes(anime_session):
-    all_episodes = []
-    page = 1
-    while True:
-        episode_data = await get_episode_list(anime_session, page)
-        if not episode_data or 'data' not in episode_data:
-            break
-        episodes = episode_data['data']
-        all_episodes.extend(episodes)
-        if page >= episode_data.get('last_page', 1):
-            break
-        page += 1
-    return all_episodes
+async def get_all_episodes(anime_session: str):
+    data = await get_episode_list(anime_session, 1)
+    return data.get("data", []) if data else []
+
 
 def find_closest_episode(episodes, target_episode):
     try:
         target = int(target_episode)
     except (ValueError, TypeError):
         return None
-    
-    valid_episodes = []
-    for ep in episodes:
+
+    valid = []
+    for ep in episodes or []:
         try:
-            ep_num = int(ep['episode'])
-            valid_episodes.append((ep_num, ep))
-        except (ValueError, TypeError):
+            valid.append((int(ep.get("episode")), ep))
+        except (TypeError, ValueError):
             continue
-    
-    if not valid_episodes:
+
+    if not valid:
         return None
-    
-    valid_episodes.sort(key=lambda x: x[0])
-    
-    closest = None
-    for ep_num, ep in valid_episodes:
-        if ep_num <= target:
-            closest = ep
-        else:
-            break
-    
-    if closest is None and valid_episodes:
-        closest = valid_episodes[0][1]
-    
-    return closest
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
-    reraise=True
-)
-def get_stream_links(anime_session: str, episode_session: str) -> Optional[List[Dict[str, Any]]]:
-    # CHANGED: uses ANIMEPAHE_BASE_URL instead of a hardcoded domain.
-    if '-' in episode_session:
-        episode_url = f"{ANIMEPAHE_BASE_URL}/play/{episode_session}"
-    else:
-        episode_url = f"{ANIMEPAHE_BASE_URL}/play/{anime_session}/{episode_session}"
-    
-    try:
-        # CHANGED: now goes through _new_scraper() so it also picks up
-        # ANIMEPAHE_PROXY if you set one -- same 403/IP-block issue can
-        # hit this endpoint too, not just search.
-        session = _new_scraper()
-        session.headers.update(HEADERS)
-        time.sleep(random.uniform(1, 3))
-        
-        local_headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
-        }
-        session.headers.update(local_headers)
-        # CHANGED: warm-up request now also goes through the configurable base URL.
-        session.get(f"{ANIMEPAHE_BASE_URL}/")
-        
-        logger.info(f"Fetching episode page: {episode_url}")
-        response = session.get(episode_url)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        buttons = soup.select('#resolutionMenu button[data-src]')
-        
-        if not buttons:
-            buttons = soup.select('button.dropdown-item[data-src]')
-        
-        if not buttons:
-            buttons = soup.select('button[data-src*="kwik"]')
-        
-        if not buttons:
-            logger.error(f"No stream buttons found for episode: {episode_url}")
-            logger.debug(f"Page sample: {response.text[:2000]}")
-            return None
-        
-        stream_links = []
-        for btn in buttons:
-            src = btn.get('data-src', '')
-            fansub = btn.get('data-fansub', 'Unknown')
-            resolution = btn.get('data-resolution', '0')
-            audio = btn.get('data-audio', 'jpn')
-            av1 = btn.get('data-av1', '0')
-            text = btn.get_text(strip=True)
-            
-            if src and 'kwik' in src:
-                stream_links.append({
-                    'url': src,
-                    'fansub': fansub,
-                    'resolution': int(resolution) if resolution.isdigit() else 0,
-                    'audio': audio,
-                    'av1': av1,
-                    'text': text
-                })
-        
-        # Direct-download (MP4) links: pahe.win -> kwik /f/ -> mp4. No HLS/m3u8.
-        direct = []
-        for a in (soup.select('#pickDownload a.dropdown-item[href]')
-                  or soup.select('a.dropdown-item[href*="pahe.win"]')):
-            href = a.get('href', '')
-            txt = a.get_text(' ', strip=True)
-            m = re.search(r'(\d{3,4})p', txt)
-            if not href or not m:
-                continue
-            direct.append({
-                'href': href,
-                'res': int(m.group(1)),
-                'audio': 'eng' if re.search(r'\beng\b', txt, re.I) else 'jpn',
-                'fansub': txt.split('\u00b7')[0].strip().lower(),
-            })
-        logger.info(f"Found {len(direct)} direct download links")
+    valid.sort(key=lambda x: x[0])
 
-        for s in stream_links:
-            s['embed_url'] = s['url']
-            cands = [d for d in direct if d['res'] == s['resolution'] and d['audio'] == s['audio']]
-            same = [d for d in cands if d['fansub'] == str(s['fansub']).strip().lower()]
-            pick = (same or cands or [None])[0]
-            if pick:
-                s['url'] = pick['href']
+    exact = next((ep for n, ep in valid if n == target), None)
+    if exact:
+        return exact
 
-        if stream_links:
-            logger.info(f"Found {len(stream_links)} stream links: {[(s['resolution'], s['audio']) for s in stream_links]}")
-            return stream_links
-        
-        logger.error(f"No valid kwik stream links found for episode: {episode_url}")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error getting stream links: {str(e)}")
-        logger.error(f"URL attempted: {episode_url}")
-        raise
-
-def _unpack_js(p, a, c, k, e=None, d=None):
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-    
-    def base_encode(n):
-        rem = n % a
-        digit = chr(rem + 29) if rem > 35 else digits[rem]
-        if n < a:
-            return digit
-        return base_encode(n // a) + digit
-
-    d = {} if d is None else d
-    for i in range(c - 1, -1, -1):
-        key = base_encode(i)
-        d[key] = k[i] if i < len(k) and k[i] else key
-
-    pattern = re.compile(r'\b\w+\b')
-    def replace(m):
-        w = m.group(0)
-        return d.get(w, w)
-
-    return pattern.sub(replace, p)
-
-def _kwik_find(html: str, pattern: str) -> Optional[str]:
-    m = re.search(pattern, html)
-    if m:
-        return m.group(1)
-    for p, a_str, c_str, k_str in re.findall(
-        r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)",
-        html, re.DOTALL
-    ):
-        try:
-            decoded = _unpack_js(p, int(a_str), int(c_str), k_str.split('|'))
-            m = re.search(pattern, decoded)
-            if m:
-                return m.group(1)
-        except Exception:
-            continue
-    return None
+    # Preserve the old behavior: use the latest episode <= target.
+    previous = [ep for n, ep in valid if n <= target]
+    return previous[-1] if previous else valid[0][1]
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=3, max=8),
-    reraise=True
-)
-def extract_m3u8_from_kwik(link: str) -> Optional[Dict[str, Any]]:
-    """Resolve a pahe.win download link to a direct MP4 URL (no m3u8).
+def _episode_from_session(anime_session: str, episode_session: str) -> tuple[str, int]:
+    """Read the synthetic hiyori:<anilist_id>:<episode> session."""
+    if isinstance(episode_session, str) and episode_session.startswith("hiyori:"):
+        parts = episode_session.split(":", 2)
+        if len(parts) == 3:
+            return parts[1], int(parts[2])
 
-    Name kept so existing callers in handlers.py / scheduler.py work
-    unchanged. Returns {'m3u8_url': <mp4 url>, 'headers': {...}}.
+    return str(anime_session), int(episode_session)
+
+
+def _find_provider_episode_ids(
+    providers: Dict[str, Any],
+    episode_number: int,
+) -> Dict[str, List[str]]:
     """
-    if 'pahe.win' not in link and '/f/' not in link:
-        logger.error(f"No direct download link (got embed link): {link}")
-        return None
+    Return provider episode IDs grouped by sub/dub.
+    Each ID is directly usable as Hiyori's /watch/... path.
+    """
+    found = {"sub": [], "dub": []}
 
-    session = _new_scraper()
-    session.headers.update({"User-Agent": KWIK_USER_AGENT})
+    for provider_name, provider_data in (providers or {}).items():
+        if not isinstance(provider_data, dict):
+            continue
 
-    kwik_f = link
-    if 'pahe.win' in link:
-        r = session.get(link, headers={"Referer": "https://animepahe.pw/"},
-                        timeout=30, allow_redirects=True)
-        r.raise_for_status()
-        kwik_f = _kwik_find(r.text, r"(https?://kwik\.[a-z]+/f/[A-Za-z0-9]+)")
-        if not kwik_f and '/f/' in r.url:
-            kwik_f = r.url
-        if not kwik_f:
-            logger.error(f"No kwik /f/ link found on pahe.win page (status {r.status_code})")
+        groups = provider_data.get("episodes") or {}
+        if not isinstance(groups, dict):
+            continue
+
+        for language in ("sub", "dub"):
+            for ep in groups.get(language) or []:
+                if not isinstance(ep, dict):
+                    continue
+                try:
+                    number = int(ep.get("number"))
+                except (TypeError, ValueError):
+                    continue
+
+                if number != episode_number:
+                    continue
+
+                ep_id = ep.get("id")
+                if isinstance(ep_id, str) and ep_id and ep_id not in found[language]:
+                    found[language].append(ep_id)
+
+    return found
+
+
+def _quality_from_resolution(width: int, height: int) -> str:
+    if height >= 2160:
+        return "2160p"
+    if height >= 1080:
+        return "1080p"
+    if height >= 720:
+        return "720p"
+    if height >= 480:
+        return "480p"
+    if height >= 360:
+        return "360p"
+    return f"{height}p"
+
+
+def _parse_hls_variants(master_url: str) -> List[Dict[str, Any]]:
+    """
+    Expand an HLS master playlist into real quality-specific media
+    playlists. If the playlist has only one variant, that one is returned.
+    """
+    try:
+        response = _session.get(
+            master_url,
+            headers={
+                "User-Agent": HLS_USER_AGENT,
+                "Referer": HLS_REFERER,
+                "Accept": "*/*",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        text = response.text
+
+        if "#EXTM3U" not in text:
+            return []
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        variants: List[Dict[str, Any]] = []
+
+        for i, line in enumerate(lines):
+            if not line.startswith("#EXT-X-STREAM-INF:"):
+                continue
+
+            resolution = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+            bandwidth = re.search(r"BANDWIDTH=(\d+)", line)
+
+            # URI is the first non-tag line after EXT-X-STREAM-INF.
+            variant_uri = None
+            for following in lines[i + 1:]:
+                if not following.startswith("#"):
+                    variant_uri = urljoin(master_url, following)
+                    break
+
+            if not variant_uri:
+                continue
+
+            if resolution:
+                width = int(resolution.group(1))
+                height = int(resolution.group(2))
+            else:
+                width, height = 0, 0
+
+            variants.append({
+                "url": variant_uri,
+                "master_url": master_url,
+                "resolution": height or 0,
+                "width": width,
+                "height": height,
+                "quality": _quality_from_resolution(width, height) if height else None,
+                "bandwidth": int(bandwidth.group(1)) if bandwidth else 0,
+            })
+
+        # Some providers return a media playlist directly instead of a
+        # master. Treat it as a single stream rather than failing.
+        if not variants and "#EXTINF:" in text:
+            return [{
+                "url": master_url,
+                "master_url": master_url,
+                "resolution": 0,
+                "width": 0,
+                "height": 0,
+                "quality": None,
+                "bandwidth": 0,
+            }]
+
+        return variants
+
+    except Exception as e:
+        logger.warning("Failed to parse HLS master %s: %s", master_url, e)
+        return []
+
+
+def _stream_quality_number(stream: Dict[str, Any]) -> int:
+    value = stream.get("quality") or stream.get("resolution") or 0
+    if isinstance(value, str):
+        match = re.search(r"(\d{3,4})", value)
+        if match:
+            return int(match.group(1))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_stream_links(anime_session: str, episode_session: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    Resolve a synthetic episode session through Hiyori.
+
+    Output fields intentionally match the old AnimePahe stream objects:
+      url, fansub, resolution, audio, av1, text
+    """
+    try:
+        anilist_id, episode_number = _episode_from_session(
+            anime_session, episode_session
+        )
+
+        episodes_data = _hiyori_get_json(f"/episodes/{anilist_id}")
+        provider_ids = _find_provider_episode_ids(
+            episodes_data.get("providers") or {},
+            episode_number,
+        )
+
+        stream_links: List[Dict[str, Any]] = []
+        seen = set()
+
+        # Prefer SUB and DUB separately. We keep the first successful
+        # provider(s), but allow multiple providers when useful.
+        for language, ids in (("sub", provider_ids["sub"]), ("dub", provider_ids["dub"])):
+            for episode_id in ids:
+                try:
+                    stream_data = _hiyori_get_json(f"/{episode_id}")
+                except Exception as e:
+                    logger.warning(
+                        "Hiyori stream failed for %s/%s: %s",
+                        language, episode_id, e
+                    )
+                    continue
+
+                streams = stream_data.get("streams") or []
+                if isinstance(streams, dict):
+                    streams = streams.get("data") or streams.get("streams") or []
+                if not isinstance(streams, list):
+                    continue
+
+                for source in streams:
+                    if not isinstance(source, dict):
+                        continue
+
+                    master_url = source.get("url")
+                    if not isinstance(master_url, str) or ".m3u8" not in master_url:
+                        continue
+
+                    variants = _parse_hls_variants(master_url)
+                    if not variants:
+                        variants = [{
+                            "url": master_url,
+                            "resolution": _stream_quality_number(source),
+                            "quality": source.get("quality"),
+                            "width": 0,
+                            "height": _stream_quality_number(source),
+                            "bandwidth": 0,
+                        }]
+
+                    for variant in variants:
+                        resolution = int(variant.get("resolution") or 0)
+                        quality = variant.get("quality") or (
+                            f"{resolution}p" if resolution else "HLS"
+                        )
+
+                        # Hiyori's category is the reliable audio marker.
+                        audio = "eng" if language == "dub" else "jpn"
+                        key = (audio, variant["url"])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        stream_links.append({
+                            "url": variant["url"],
+                            "master_url": master_url,
+                            "fansub": episode_id.split("/")[1] if "/" in episode_id else "hiyori",
+                            "resolution": resolution,
+                            "audio": audio,
+                            "av1": "0",
+                            "text": f"{quality} ({audio.upper()})",
+                            "quality": quality,
+                            "headers": {
+                                "User-Agent": HLS_USER_AGENT,
+                                "Referer": HLS_REFERER,
+                            },
+                        })
+
+                # Once a provider gave streams, don't hammer every provider.
+                if any(s.get("audio") == ("eng" if language == "dub" else "jpn")
+                       for s in stream_links):
+                    break
+
+        if not stream_links:
+            logger.error(
+                "No Hiyori streams found for AniList %s episode %s",
+                anilist_id, episode_number
+            )
             return None
 
-    kp = urlparse(kwik_f)
-    kwik_base = f"{kp.scheme}://{kp.netloc}"
-    page = session.get(kwik_f, headers={"Referer": link}, timeout=30, allow_redirects=True)
-    page.raise_for_status()
+        stream_links.sort(
+            key=lambda s: (0 if s["audio"] == "jpn" else 1, s["resolution"])
+        )
 
-    token = _kwik_find(page.text, r'name="_token"\s+value="([^"]+)"')
-    action = _kwik_find(page.text, r'<form[^>]+action="([^"]+)"') or _kwik_find(
-        page.text, r"(https?://kwik\.[a-z]+/d/[A-Za-z0-9]+)")
-    if not token or not action:
-        logger.error("kwik /f/ page: token or form action not found")
-        return None
-    if action.startswith('/'):
-        action = kwik_base + action
+        logger.info(
+            "Hiyori streams for AniList %s Ep%s: %s",
+            anilist_id,
+            episode_number,
+            [(s["resolution"], s["audio"], s["fansub"]) for s in stream_links],
+        )
+        return stream_links
 
-    resp = session.post(
-        action, data={"_token": token},
-        headers={"Referer": kwik_f, "Origin": kwik_base,
-                 "Content-Type": "application/x-www-form-urlencoded"},
-        allow_redirects=False, timeout=30,
-    )
-    mp4 = resp.headers.get("location")
-    if not mp4:
-        logger.error(f"kwik POST returned {resp.status_code} with no redirect")
+    except Exception as e:
+        logger.exception("Error getting Hiyori stream links: %s", e)
         return None
 
-    logger.info(f"Resolved direct MP4: {mp4[:80]}...")
+
+def extract_m3u8_from_kwik(link: str) -> Optional[Dict[str, Any]]:
+    """
+    Compatibility wrapper.
+
+    The old function resolved AnimePahe/Kwik links. Hiyori already returns
+    an HLS URL, so we simply pass it through with the required headers.
+    """
+    if not isinstance(link, str) or ".m3u8" not in link:
+        logger.error("Expected Hiyori HLS URL, got: %s", link)
+        return None
+
     return {
-        'm3u8_url': mp4,   # key name kept for compatibility; this is an MP4 URL
-        'headers': {"Referer": f"{kwik_base}/", "User-Agent": KWIK_USER_AGENT},
+        "m3u8_url": link,
+        "headers": {
+            "User-Agent": HLS_USER_AGENT,
+            "Referer": HLS_REFERER,
+        },
     }
 
 
-def _direct_download_sync(url, headers, output_path, state):
-    session = _new_scraper()
-    with session.get(url, headers=headers, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        state['total'] = int(r.headers.get('content-length', 0) or 0)
-        with open(output_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=1024 * 512):
-                if chunk:
-                    f.write(chunk)
-                    state['done'] += len(chunk)
-    state['finished'] = True
+async def download_m3u8(
+    m3u8_url: str,
+    headers: Dict[str, str],
+    output_path: str,
+    progress_callback=None,
+) -> bool:
+    """
+    Compatibility wrapper around the bot's real HLS downloader.
 
+    The previous implementation downloaded direct MP4 files. Hiyori
+    returns HLS, so use core.downloader.download_m3u8 here.
+    """
+    from core.downloader import download_m3u8 as _download_hls
 
-async def download_m3u8(m3u8_url: str, headers: Dict[str, str], output_path: str,
-                        progress_callback=None) -> bool:
-    """Direct MP4 download (name kept for compatibility; no m3u8/ffmpeg)."""
-    from core.downloader import DownloadProgress
+    return await _download_hls(
+        m3u8_url=m3u8_url,
+        output_path=output_path,
+        headers=headers or {},
+        progress_callback=progress_callback,
+    )
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
-    state = {'done': 0, 'total': 0, 'finished': False}
-    start = time.time()
-    task = asyncio.create_task(asyncio.to_thread(
-        _direct_download_sync, m3u8_url, headers, output_path, state))
-
-    prog = DownloadProgress(status="downloading")
-    last_bytes, last_ts = 0, start
-    while not task.done():
-        await asyncio.sleep(3)
-        now = time.time()
-        prog.downloaded_bytes = state['done']
-        prog.total_bytes = state['total']
-        prog.speed_bps = (state['done'] - last_bytes) / max(now - last_ts, 0.001)
-        prog.elapsed = now - start
-        if state['total'] and prog.speed_bps > 0:
-            prog.eta = (state['total'] - state['done']) / prog.speed_bps
-        last_bytes, last_ts = state['done'], now
-        if progress_callback:
-            try:
-                await progress_callback(prog)
-            except Exception:
-                pass
-
-    try:
-        await task
-    except Exception as e:
-        logger.error(f"Direct download failed: {e}")
-        prog.status = "failed"
-        if progress_callback:
-            try:
-                await progress_callback(prog)
-            except Exception:
-                pass
-        return False
-
-    ok = os.path.exists(output_path) and os.path.getsize(output_path) > 1000
-    prog.status = "done" if ok else "failed"
-    prog.downloaded_bytes = prog.total_bytes = state['done']
-    prog.elapsed = time.time() - start
-    if progress_callback:
-        try:
-            await progress_callback(prog)
-        except Exception:
-            pass
-    return ok
 
 def map_resolution_to_quality_tier(resolution: int) -> str:
     if resolution <= 360:
         return "360p"
     elif resolution <= 720:
         return "720p"
-    else:
+    elif resolution <= 1080:
         return "1080p"
+    else:
+        return "2160p"
 
-def get_quality_streams(stream_links: List[Dict[str, Any]], enabled_qualities: List[str], 
-                        preferred_audio: str = "jpn") -> Dict[str, Dict[str, Any]]:
-    filtered = [s for s in stream_links if s['audio'] == preferred_audio]
-    
+
+def get_quality_streams(
+    stream_links: List[Dict[str, Any]],
+    enabled_qualities: List[str],
+    preferred_audio: str = "jpn",
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Select one real Hiyori HLS variant for every enabled quality.
+
+    Important: a quality is only returned when that quality actually exists.
+    No fake 480p/720p entries are created.
+    """
+    filtered = [s for s in stream_links if s.get("audio") == preferred_audio]
+
     if not filtered:
         filtered = stream_links
-        logger.warning(f"No streams found for audio '{preferred_audio}', using all available")
-    
-    result = {}
+        logger.warning(
+            "No streams found for audio '%s', using all available",
+            preferred_audio,
+        )
+
+    result: Dict[str, Dict[str, Any]] = {}
+
     for quality in enabled_qualities:
-        target_value = int(quality[:-1])
-        
-        exact = [s for s in filtered if s['resolution'] == target_value]
-        if exact:
-            result[quality] = exact[0]
+        try:
+            target = int(str(quality).rstrip("p"))
+        except ValueError:
             continue
-        
-        candidates = [(s['resolution'], s) for s in filtered 
-                     if map_resolution_to_quality_tier(s['resolution']) == quality]
-        
+
+        exact = [s for s in filtered if int(s.get("resolution") or 0) == target]
+        if exact:
+            result[quality] = exact[-1]
+            continue
+
+        candidates = [
+            s for s in filtered
+            if map_resolution_to_quality_tier(int(s.get("resolution") or 0)) == quality
+        ]
+
         if candidates:
-            candidates.sort(key=lambda x: x[0])
-            if quality == "360p":
-                result[quality] = candidates[0][1]
-            else:
-                result[quality] = candidates[-1][1]
-    
+            candidates.sort(key=lambda s: int(s.get("resolution") or 0))
+            result[quality] = candidates[0] if target <= 360 else candidates[-1]
+
     return result
 
+
 def detect_audio_type(stream_links: List[Dict[str, Any]]) -> str:
-    has_eng = any(s['audio'] == 'eng' for s in stream_links)
-    has_jpn = any(s['audio'] == 'jpn' for s in stream_links)
-    
+    has_eng = any(s.get("audio") == "eng" for s in stream_links)
+    has_jpn = any(s.get("audio") == "jpn" for s in stream_links)
+
     if has_eng and not has_jpn:
         return "Dub"
     return "Sub"
 
+
 def get_sub_dub_streams(stream_links: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    sub_streams = [s for s in stream_links if s['audio'] == 'jpn']
-    dub_streams = [s for s in stream_links if s['audio'] == 'eng']
-    
     return {
-        'sub': sub_streams,
-        'dub': dub_streams
+        "sub": [s for s in stream_links if s.get("audio") == "jpn"],
+        "dub": [s for s in stream_links if s.get("audio") == "eng"],
     }
+
+
+def get_latest_releases(page=1):
+    """
+    Keep the old {'data': [...]} shape used by handlers/scheduler.
+
+    Hiyori's /schedule gives the next airing episode. When it is still in
+    the future, we expose next_episode - 1 as the currently released episode.
+    """
+    try:
+        data = _hiyori_get_json(
+            "/schedule",
+            {"page": page, "per_page": 20},
+        )
+        results = data.get("results") or data.get("data") or []
+
+        normalized = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+
+            # Full anime info may be nested.
+            anime = item.get("anime") if isinstance(item.get("anime"), dict) else item
+            title = _title_text(anime)
+            episode = _episode_value(item)
+
+            if episode <= 0:
+                episode = _episode_value(anime)
+
+            normalized.append({
+                "anime_title": title,
+                "episode": episode,
+                "session": str(anime.get("id") or item.get("id") or ""),
+                "anilist_id": anime.get("id") or item.get("id"),
+                "airingAt": item.get("airingAt"),
+                "timeUntilAiring": item.get("timeUntilAiring"),
+            })
+
+        return {
+            "data": normalized,
+            "page": data.get("page", page),
+            "last_page": 1,
+            "total": len(normalized),
+        }
+
+    except Exception as e:
+        logger.error("Error fetching Hiyori schedule: %s", e)
+        return {"data": [], "page": page, "last_page": 1, "total": 0}
+
 
 async def get_anime_info(title: str) -> Dict[str, Any]:
+    """
+    Keep the existing AniList-backed metadata function. This is used for
+    posters/info and does not depend on AnimePahe.
+    """
     query = """
-query ($id: Int, $search: String, $seasonYear: Int) {
-  Media(id: $id, type: ANIME, search: $search, seasonYear: $seasonYear) {
-    id
-    idMal
-    title {
-      romaji
-      english
-      native
-    }
-    type
-    format
-    status(version: 2)
-    description(asHtml: false)
-    startDate {
-      year
-      month
-      day
-    }
-    endDate {
-      year
-      month
-      day
-    }
-    season
-    seasonYear
-    episodes
-    duration
-    chapters
-    volumes
-    countryOfOrigin
-    source
-    hashtag
-    trailer {
-      id
-      site
-      thumbnail
-    }
-    updatedAt
-    coverImage {
-      extraLarge
-      large
-    }
-    bannerImage
-    genres
-    synonyms
-    averageScore
-    meanScore
-    popularity
-    trending
-    favourites
-    studios {
-      nodes {
-         name
-         siteUrl
-      }
-    }
-    isAdult
-    nextAiringEpisode {
-      airingAt
-      timeUntilAiring
-      episode
-    }
-    airingSchedule {
-      edges {
-        node {
-          airingAt
-          timeUntilAiring
-          episode
+    query ($search: String) {
+      Media(search: $search, type: ANIME) {
+        id
+        idMal
+        title { romaji english native }
+        type
+        format
+        status(version: 2)
+        description(asHtml: false)
+        startDate { year month day }
+        endDate { year month day }
+        season
+        seasonYear
+        episodes
+        duration
+        chapters
+        volumes
+        countryOfOrigin
+        source
+        hashtag
+        trailer { id site thumbnail }
+        updatedAt
+        coverImage { extraLarge large medium }
+        bannerImage
+        genres
+        synonyms
+        averageScore
+        meanScore
+        popularity
+        trending
+        favourites
+        studios { nodes { name siteUrl } }
+        isAdult
+        nextAiringEpisode { airingAt timeUntilAiring episode }
+        airingSchedule {
+          edges { node { airingAt timeUntilAiring episode } }
         }
-      }
-    }
-    externalLinks {
-      url
-      site
-    }
-    relations {
-      edges {
-        relationType
-        node {
-          id
-          bannerImage
+        externalLinks { url site }
+        relations {
+          edges {
+            relationType
+            node { id bannerImage }
+          }
         }
+        siteUrl
       }
     }
-    siteUrl
-  }
-}
-
-"""
-
-    variables = {'search': title}
-    url = 'https://graphql.anilist.co'
+    """
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json={'query': query, 'variables': variables}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(
+                "https://graphql.anilist.co",
+                json={"query": query, "variables": {"search": title}},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
                 if resp.status != 200:
-                    logger.error(f"AniList API returned {resp.status}")
+                    logger.error("AniList API returned %s", resp.status)
                     return {}
                 data = await resp.json()
-                media = data.get('data', {}).get('Media', {})
-                return media if media else {}
+                return data.get("data", {}).get("Media", {}) or {}
     except Exception as e:
-        logger.error(f"Error fetching anime info from AniList: {e}")
+        logger.error("Error fetching anime info from AniList: %s", e)
         return {}
-
-
-def find_closest_episode(episodes: List[Dict], target_episode: int) -> Optional[Dict]:
-    if not episodes:
-        return None
-
-    exact = None
-    for ep in episodes:
-        try:
-            ep_num = int(ep.get('episode', 0))
-            if ep_num == target_episode:
-                exact = ep
-                break
-        except (ValueError, TypeError):
-            continue
-
-    if exact:
-        return exact
-
-    closest = None
-    min_diff = float('inf')
-    for ep in episodes:
-        try:
-            ep_num = int(ep.get('episode', 0))
-            diff = abs(ep_num - target_episode)
-            if diff < min_diff:
-                min_diff = diff
-                closest = ep
-        except (ValueError, TypeError):
-            continue
-
-    return closest
 
 
 async def download_anime_poster(title: str, save_dir: str = None) -> Optional[str]:
@@ -642,27 +753,31 @@ async def download_anime_poster(title: str, save_dir: str = None) -> Optional[st
         if not info:
             return None
 
-        image_url = info.get('bannerImage')
+        image_url = info.get("bannerImage")
 
         if not image_url:
-            relations = info.get('relations', {}).get('edges', [])
+            relations = info.get("relations", {}).get("edges", [])
             for rel in relations:
-                if rel.get('relationType') in ('PREQUEL', 'PARENT', 'SOURCE'):
-                    node_banner = rel.get('node', {}).get('bannerImage')
+                if rel.get("relationType") in ("PREQUEL", "PARENT", "SOURCE"):
+                    node_banner = rel.get("node", {}).get("bannerImage")
                     if node_banner:
                         image_url = node_banner
                         break
             if not image_url:
                 for rel in relations:
-                    node_banner = rel.get('node', {}).get('bannerImage')
+                    node_banner = rel.get("node", {}).get("bannerImage")
                     if node_banner:
                         image_url = node_banner
                         break
 
         if not image_url:
-            cover_image = info.get('coverImage', {})
+            cover_image = info.get("coverImage", {})
             if cover_image:
-                image_url = cover_image.get('extraLarge') or cover_image.get('large') or cover_image.get('medium')
+                image_url = (
+                    cover_image.get("extraLarge")
+                    or cover_image.get("large")
+                    or cover_image.get("medium")
+                )
 
         if not image_url:
             return None
@@ -671,22 +786,26 @@ async def download_anime_poster(title: str, save_dir: str = None) -> Optional[st
             save_dir = str(Path(__file__).parent.parent / "thumbnails")
 
         os.makedirs(save_dir, exist_ok=True)
-        safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:50]
+        safe_title = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "_")[:50]
         save_path = os.path.join(save_dir, f"{safe_title}_poster.jpg")
 
         if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
             return save_path
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(
+                image_url,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.read()
-                    with open(save_path, 'wb') as f:
+                    with open(save_path, "wb") as f:
                         f.write(data)
                     if os.path.getsize(save_path) > 1000:
                         return save_path
 
         return None
+
     except Exception as e:
-        logger.error(f"Error downloading anime poster: {e}")
+        logger.error("Error downloading anime poster: %s", e)
         return None
