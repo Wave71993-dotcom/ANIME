@@ -178,15 +178,110 @@ async def _resolve_channel_target(client, channel_id, channel_username):
     return None
 
 
+async def _get_saved_media_message(client, anime_title, kind):
+    try:
+        media_map = bot_settings.get(f"anime_{kind}s", {}) or {}
+        ref = media_map.get(anime_title)
+        if not ref or not ref.get("chat_id") or not ref.get("message_id"):
+            return None
+        return await client.get_messages(ref["chat_id"], ids=ref["message_id"])
+    except Exception as exc:
+        logger.warning("Could not load saved %s for %s: %s", kind, anime_title, exc)
+        return None
+
+async def _download_saved_media_url(url, path):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 200:
+                    with open(path, "wb") as fh:
+                        fh.write(await resp.read())
+                    return path
+    except Exception as exc:
+        logger.warning("Could not download saved media URL: %s", exc)
+    return None
+
+async def _get_anime_thumb_path(client, anime_title):
+    media_map = bot_settings.get("anime_thumbs", {}) or {}
+    ref = media_map.get(anime_title)
+    if not ref:
+        return await get_fixed_thumbnail()
+    path = os.path.join(DOWNLOAD_DIR, f"thumb_{sanitize_filename(anime_title)}.jpg")
+    try:
+        if ref.get("url"):
+            return await _download_saved_media_url(ref["url"], path) or await get_fixed_thumbnail()
+        msg = await _get_saved_media_message(client, anime_title, "thumb")
+        if msg and msg.media:
+            result = await client.download_media(msg, file=path)
+            return result or await get_fixed_thumbnail()
+    except Exception as exc:
+        logger.warning("Could not prepare anime thumb: %s", exc)
+    return await get_fixed_thumbnail()
+
+async def _get_anime_poster_media(client, anime_title):
+    media_map = bot_settings.get("anime_posters", {}) or {}
+    ref = media_map.get(anime_title)
+    if ref:
+        if ref.get("url"):
+            path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}.jpg")
+            return await _download_saved_media_url(ref["url"], path)
+        msg = await _get_saved_media_message(client, anime_title, "poster")
+        if msg and msg.media:
+            return msg.media
+    return None
+
+async def _send_anime_sticker(client, target, anime_title):
+    try:
+        msg = await _get_saved_media_message(client, anime_title, "sticker")
+        if msg and msg.media:
+            await client.send_file(target, msg.media)
+    except Exception as exc:
+        logger.warning("Could not send anime sticker for %s: %s", anime_title, exc)
+
+def _post_format_caption(anime_title, anime_info, episode_number, audio_type, channel_format):
+    titles = (anime_info or {}).get('title', {})
+    english = titles.get('english') or ''
+    romaji = titles.get('romaji') or anime_title
+    genres = ', '.join((anime_info or {}).get('genres', [])[:4])
+    score = (anime_info or {}).get('averageScore', '')
+    studios = ', '.join([x.get('name','') for x in ((anime_info or {}).get('studios', {}) or {}).get('nodes', [])[:2]])
+    audio = 'Japanese' if audio_type == 'Sub' else 'English'
+    fmt = bot_settings.get('post_formats', {}) or {}
+    template = fmt.get('caption_template', '') if isinstance(fmt, dict) else ''
+    if template:
+        try:
+            return template.format(title=romaji, english=english, episode=episode_number, audio=audio,
+                                   genres=genres, score=score, studio=studios, channel=channel_format)
+        except Exception as exc:
+            logger.warning("Invalid custom caption format: %s", exc)
+    caption = (f"<b><blockquote>✦ {english or romaji} ✦</blockquote>\n"
+               f"──────────────────\n<blockquote>"
+               f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n・ Aᴜᴅɪᴏ: {audio}")
+    if genres:
+        caption += f"\n・ Gᴇɴʀᴇs: {genres}"
+    caption += (f"</blockquote>\n──────────────────\n"
+                 f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>")
+    return caption
+
+def _custom_buttons(anime_title):
+    data = bot_settings.get('anime_custom_buttons', {}) or {}
+    return [Button.url(str(item.get('text','Button'))[:64], str(item.get('url'))) for item in data.get(anime_title, [])
+            if isinstance(item, dict) and item.get('url')]
+
+
 async def post_anime_with_buttons(client, anime_title, anime_info, episode_number, audio_type, quality_files):
     from core.config import CHANNEL_ID, CHANNEL_USERNAME, FIXED_THUMBNAIL_URL
+    from core.database import get_anime_channel
 
-    channel_target = await _resolve_channel_target(client, CHANNEL_ID, CHANNEL_USERNAME)
+    anime_channel = await get_anime_channel(anime_title)
+    target_id = anime_channel.get("channel_id") if anime_channel else CHANNEL_ID
+    target_username = anime_channel.get("channel_username") if anime_channel else CHANNEL_USERNAME
+    channel_target = await _resolve_channel_target(client, target_id, target_username)
     if not channel_target:
         logger.warning("No resolvable main channel configured for posting")
         return
 
-    channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
+    channel_format = (target_username or CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
 
     try:
         title_romaji = anime_title
@@ -209,19 +304,7 @@ async def post_anime_with_buttons(client, anime_title, anime_info, episode_numbe
         else:
             audio_alpha = "English"
 
-        caption = (
-            f"<b><blockquote>✦ {title_english} ✦</blockquote>\n"
-            f"──────────────────\n"
-            f"<blockquote>"
-        )
-        caption += f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-        caption += f"・ Aᴜᴅɪᴏ: {audio_alpha}\n"
-        if genres:
-            caption += f"・ Gᴇɴʀᴇs: {genres}</blockquote>\n"
-        caption += (
-            f"──────────────────\n"
-            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>"
-        )
+        caption = _post_format_caption(anime_title, anime_info, episode_number, audio_type, channel_format)
 
         button_list = []
         sorted_qualities = sorted(quality_files.keys(), key=lambda x: int(x[:-1]))
@@ -251,48 +334,29 @@ async def post_anime_with_buttons(client, anime_title, anime_info, episode_numbe
             logger.error("No valid download links generated for buttons")
             return
 
-        buttons = _arrange_buttons(button_list)
+        button_list.extend(_custom_buttons(anime_title))
+        fmt = bot_settings.get('post_formats', {}) or {}
+        try: layout = int(fmt.get('button_layout', 2))
+        except Exception: layout = 2
+        buttons = _arrange_buttons(button_list, layout)
 
-        poster_path = None
-
-        ani_id = anime_info.get("id") if anime_info else None
-        image_url = f"https://img.anili.st/media/{ani_id}" if ani_id else None
-
-        if image_url:
-            import aiohttp
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        if resp.status == 200:
-                            poster_path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}.jpg")
-                            with open(poster_path, 'wb') as f:
-                                f.write(await resp.read())
-            except Exception as e:
-                logger.warning(f"Failed to download poster: {e}")
-
-        if poster_path and os.path.exists(poster_path):
-            await client.send_file(
-                channel_target,
-                poster_path,
-                caption=caption,
-                parse_mode='html',
-                buttons=buttons,
-                link_preview=False
-            )
-            try:
-                os.remove(poster_path)
-            except:
-                pass
+        poster_media = await _get_anime_poster_media(client, anime_title)
+        if poster_media:
+            await client.send_file(channel_target, poster_media, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
         else:
-            await client.send_message(
-                channel_target,
-                caption,
-                parse_mode='html',
-                buttons=buttons,
-                link_preview=False
-            )
-
-        logger.info(f"Posted {anime_title} Episode {episode_number} to channel with {len(button_list)} quality buttons")
+            ani_id = anime_info.get("id") if anime_info else None
+            image_url = f"https://img.anili.st/media/{ani_id}" if ani_id else None
+            poster_path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}.jpg") if image_url else None
+            if image_url:
+                poster_path = await _download_saved_media_url(image_url, poster_path)
+            if poster_path and os.path.exists(poster_path):
+                await client.send_file(channel_target, poster_path, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
+                try: os.remove(poster_path)
+                except: pass
+            else:
+                await client.send_message(channel_target, caption, parse_mode='html', buttons=buttons, link_preview=False)
+        await _send_anime_sticker(client, channel_target, anime_title)
+        logger.info(f"Posted {anime_title} Episode {episode_number} to channel with {len(button_list)} buttons")
 
     except FloodWaitError as e:
         logger.warning(f"Flood wait during post: {e.seconds}s")
@@ -303,32 +367,25 @@ async def post_anime_with_buttons(client, anime_title, anime_info, episode_numbe
         raise
 
 
-def _arrange_buttons(button_list):
-    if len(button_list) == 1:
-        return [[button_list[0]]]
-    elif len(button_list) == 2:
-        return [[button_list[0], button_list[1]]]
-    else:
-        rows = []
-        i = 0
-        while i < len(button_list):
-            if i + 1 < len(button_list):
-                rows.append([button_list[i], button_list[i + 1]])
-                i += 2
-            else:
-                rows.append([button_list[i]])
-                i += 1
-        return rows
+def _arrange_buttons(button_list, per_row=2):
+    try: per_row = max(1, min(3, int(per_row)))
+    except Exception: per_row = 2
+    return [button_list[i:i + per_row] for i in range(0, len(button_list), per_row)]
+
 
 async def post_anime_batch_with_buttons(client, anime_title, anime_info, quality_files, total_episodes, audio_type):
     from core.config import CHANNEL_ID, CHANNEL_USERNAME
+    from core.database import get_anime_channel
 
-    channel_target = await _resolve_channel_target(client, CHANNEL_ID, CHANNEL_USERNAME)
+    anime_channel = await get_anime_channel(anime_title)
+    target_id = anime_channel.get("channel_id") if anime_channel else CHANNEL_ID
+    target_username = anime_channel.get("channel_username") if anime_channel else CHANNEL_USERNAME
+    channel_target = await _resolve_channel_target(client, target_id, target_username)
     if not channel_target:
         logger.warning("No resolvable main channel configured for posting")
         return
 
-    channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
+    channel_format = (target_username or CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
 
     try:
         title_romaji = anime_title
@@ -346,19 +403,7 @@ async def post_anime_batch_with_buttons(client, anime_title, anime_info, quality
         else:
             audio_alpha = "English"
 
-        caption = (
-            f"<b><blockquote>✦ {title_romaji} ✦</blockquote>\n"
-            f"──────────────────\n"
-            f"<blockquote>"
-            f"・ Eᴘɪsᴏᴅᴇs: 1-{total_episodes}\n"
-            f"・ Aᴜᴅɪᴏ: {audio_alpha}\n"
-        )
-        if genres:
-            caption += f"・ Gᴇɴʀᴇs: {genres}</blockquote>\n"
-        caption += (
-            f"──────────────────\n"
-            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>"
-        )
+        caption = _post_format_caption(anime_title, anime_info, f"1-{total_episodes}", audio_type, channel_format)
 
         button_list = []
         sorted_qualities = sorted(quality_files.keys(), key=lambda x: int(x[:-1]))
@@ -388,47 +433,27 @@ async def post_anime_batch_with_buttons(client, anime_title, anime_info, quality
             logger.error("No valid download links for batch buttons")
             return
 
-        buttons = _arrange_buttons(button_list)
-
-        poster_path = None
-
-        ani_id = anime_info.get("id") if anime_info else None
-        image_url = f"https://img.anili.st/media/{ani_id}" if ani_id else None
-
-        if image_url:
-            import aiohttp
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        if resp.status == 200:
-                            poster_path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}_batch.jpg")
-                            with open(poster_path, 'wb') as f:
-                                f.write(await resp.read())
-            except Exception as e:
-                logger.warning(f"Failed to download batch poster: {e}")
-
-        if poster_path and os.path.exists(poster_path):
-            await client.send_file(
-                channel_target,
-                poster_path,
-                caption=caption,
-                parse_mode='html',
-                buttons=buttons,
-                link_preview=False
-            )
-            try:
-                os.remove(poster_path)
-            except:
-                pass
+        button_list.extend(_custom_buttons(anime_title))
+        fmt = bot_settings.get('post_formats', {}) or {}
+        try: layout = int(fmt.get('button_layout', 2))
+        except Exception: layout = 2
+        buttons = _arrange_buttons(button_list, layout)
+        poster_media = await _get_anime_poster_media(client, anime_title)
+        if poster_media:
+            await client.send_file(channel_target, poster_media, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
         else:
-            await client.send_message(
-                channel_target,
-                caption,
-                parse_mode='html',
-                buttons=buttons,
-                link_preview=False
-            )
-
+            ani_id = anime_info.get("id") if anime_info else None
+            image_url = f"https://img.anili.st/media/{ani_id}" if ani_id else None
+            poster_path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}_batch.jpg") if image_url else None
+            if image_url:
+                poster_path = await _download_saved_media_url(image_url, poster_path)
+            if poster_path and os.path.exists(poster_path):
+                await client.send_file(channel_target, poster_path, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
+                try: os.remove(poster_path)
+                except: pass
+            else:
+                await client.send_message(channel_target, caption, parse_mode='html', buttons=buttons, link_preview=False)
+        await _send_anime_sticker(client, channel_target, anime_title)
         logger.info(f"Posted batch: {anime_title} ({total_episodes} episodes) to channel")
 
     except Exception as e:
@@ -510,7 +535,7 @@ async def _download_and_upload_single_quality(
             )
             await progress.update(text, parse_mode='html')
         
-        thumb = await get_fixed_thumbnail()
+        thumb = await _get_anime_thumb_path(client, anime_title)
         
         dump_msg_id = await robust_upload_file(
             file_path=download_path,
@@ -1287,7 +1312,7 @@ async def process_daily_requests(client):
                         first_ep_streams = get_stream_links(anime_session, episodes[0].get('session'))
                         audio_type = detect_audio_type(first_ep_streams) if first_ep_streams else "Sub"
                         
-                        thumb = await get_fixed_thumbnail()
+                        thumb = await _get_anime_thumb_path(client, anime_title)
                         
                         for ep_idx, episode in enumerate(episodes):
                             episode_number = int(episode.get('episode', 0))

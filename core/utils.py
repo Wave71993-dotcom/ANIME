@@ -22,7 +22,7 @@ from core.config import (
 from core.database import (
     admins_collection, processed_episodes_collection,
     anime_banners_collection, anime_hashtags_collection,
-    load_json_data, save_json_data
+    load_json_data, save_json_data, load_bot_setting
 )
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,21 @@ def format_filename(anime_title, episode_number, quality, type_str):
     clean_title = re.sub(r'\s*\(.*?\)\s*', '', anime_title)
     clean_title = re.sub(r'\s*\[.*?\]\s*', '', clean_title)
     clean_title = clean_title.strip()
-    
+
+    # Optional admin-configured filename format. Empty means keep the original.
+    try:
+        formats = load_bot_setting("post_formats", {}) or {}
+        template = formats.get("filename_template", "") if isinstance(formats, dict) else ""
+        if template:
+            rendered = template.format(
+                title=clean_title, episode=ep_num, quality=quality,
+                audio=type_str, season=season
+            )
+            if rendered.strip():
+                return sanitize_filename(rendered.strip())
+    except Exception as exc:
+        logger.debug("Custom filename format unavailable: %s", exc)
+
     return f"[{season}-{ep_num}] {clean_title} [{quality}] [{type_str}]"
 
 async def resolve_channel_entity(client, channel_id_or_username):

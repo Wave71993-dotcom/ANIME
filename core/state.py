@@ -575,6 +575,10 @@ class UserState:
         self.quality_setting = False
         self.rate_limited_until = 0
         self.current_batch_page = 1
+        self._manage_media_step = None
+        self._manage_media_anime = None
+        self._manage_channel_anime = None
+        self._manage_button_anime = None
 
 class DeferredEpisodes:
     """Tracks episodes that are waiting for all selected qualities to become available on the site."""

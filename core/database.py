@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import re
 from datetime import datetime
 from typing import List
 
@@ -269,10 +270,14 @@ async def get_anime_channel(anime_title: str) -> dict:
     try:
         if anime_channels_collection is not None:
             result = anime_channels_collection.find_one({"anime_title": anime_title})
+            if result:
+                return result
+            # Fallback for capitalization differences between provider/API titles.
+            result = anime_channels_collection.find_one({"anime_title": {"$regex": f"^{re.escape(anime_title)}$", "$options": "i"}})
             return result
         else:
             data = load_json_data()
-            result = next((item for item in data.get("anime_channels", []) if item["anime_title"] == anime_title), None)
+            result = next((item for item in data.get("anime_channels", []) if item.get("anime_title", "").strip().casefold() == anime_title.strip().casefold()), None)
             return result
     except Exception as e:
         logger.error(f"Error getting anime channel: {e}")

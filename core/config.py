@@ -5,14 +5,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from typing import Any
 
-if not load_dotenv():
-    logging.warning("No .env file found or failed to load environment variables")
-
+# Railway/containers normally provide environment variables directly. A .env file
+# is optional, so its absence is not treated as an application error.
 env_file = Path(".env")
-if not env_file.exists():
-    logging.warning(f"No .env file found at {env_file.absolute()}")
-elif not env_file.read_text().strip():
-    logging.warning(f".env file exists but is empty at {env_file.absolute()}")
+if env_file.exists():
+    load_dotenv()
 
 BASE_DIR = Path.cwd()
 LOG_DIR = BASE_DIR / "logs"
