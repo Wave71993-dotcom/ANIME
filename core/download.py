@@ -11,7 +11,8 @@ from core.config import (
     DUMP_CHANNEL_ID, DUMP_CHANNEL_USERNAME, FFMPEG_PATH, DOWNLOAD_DIR,
     API_ID, API_HASH, BOT_TOKEN
 )
-from core.client import client, PYROFORK_AVAILABLE, FFMPEG_AVAILABLE
+from core.client import (client, FFMPEG_AVAILABLE, telegram_operation_lock,
+                         wait_for_global_flood_wait, set_global_flood_wait)
 from core.utils import format_size
 
 logger = logging.getLogger(__name__)
@@ -79,31 +80,7 @@ async def _upload_via_pyrogram(file_path, caption, thumb_path, target_channel,
             timeout=timeout,
         )
 
-        # Verify Telegram received the complete file. A successful API call
-        # is not enough for our pipeline because an incomplete upload must
-        # never be used to generate download links.
-        remote_size = None
-        try:
-            remote_size = getattr(getattr(pyro_msg, "document", None), "file_size", None)
-            if remote_size is None:
-                remote_size = getattr(getattr(pyro_msg, "video", None), "file_size", None)
-        except Exception:
-            pass
-        if remote_size and remote_size < int(file_size * 0.98):
-            logger.error(
-                f"Pyrogram upload incomplete: local={file_size} bytes, "
-                f"telegram={remote_size} bytes. Deleting incomplete message."
-            )
-            try:
-                await pyro.delete_messages(target_channel, pyro_msg.id)
-            except Exception as delete_error:
-                logger.warning(f"Could not delete incomplete Pyrogram upload: {delete_error}")
-            return None
-
-        logger.info(
-            f"Fast upload completed using Pyrogram: msg_id={pyro_msg.id} "
-            f"({format_size(remote_size or file_size)})"
-        )
+        logger.info(f"Fast upload completed using Pyrogram: msg_id={pyro_msg.id}")
         return pyro_msg.id
 
     finally:
@@ -115,53 +92,41 @@ async def _upload_via_pyrogram(file_path, caption, thumb_path, target_channel,
 
 async def fast_upload_file(file_path: str, caption: str, thumb_path: str = None,
                            progress_callback=None) -> Optional[int]:
-    dump_msg_id = None
-    upload_success = False
-    target_channel = DUMP_CHANNEL_ID or DUMP_CHANNEL_USERNAME
+    """Upload using the one persistent Telethon client.
 
+    A second Pyrogram bot session is deliberately not created per file. That
+    pattern was causing repeated ImportBotAuthorization/FLOOD_WAIT errors.
+    Uploads are serialized and a Telegram flood wait is shared process-wide.
+    """
+    target_channel = DUMP_CHANNEL_ID or DUMP_CHANNEL_USERNAME
     if not target_channel:
         logger.warning("No dump channel configured")
         return None
-
     if not os.path.exists(file_path):
-        logger.error(f"File does not exist: {file_path}")
+        logger.error("File does not exist: %s", file_path)
         return None
 
     file_size = os.path.getsize(file_path)
     if file_size < 1000:
-        logger.error(f"File too small: {file_path} ({file_size} bytes)")
+        logger.error("File too small: %s (%s bytes)", file_path, file_size)
         return None
 
-    PYRO_TIMEOUT = 1800
     TELETHON_TIMEOUT = 1800
 
-    if PYROFORK_AVAILABLE:
+    # Only one media upload at a time. This also prevents multiple scheduler
+    # paths from hitting Telegram simultaneously.
+    async with telegram_operation_lock:
+        await wait_for_global_flood_wait()
+
         try:
-            logger.info(f"Uploading with Pyrogram: {os.path.basename(file_path)} ({format_size(file_size)})")
-
-            dump_msg_id = await _upload_via_pyrogram(
-                file_path, caption, thumb_path, target_channel,
-                progress_callback, PYRO_TIMEOUT
-            )
-            upload_success = True
-
-        except asyncio.TimeoutError:
-            logger.warning(f"Pyrogram upload timed out after {PYRO_TIMEOUT}s, falling back to Telethon")
-            upload_success = False
-        except Exception as e:
-            logger.warning(f"Pyrogram upload failed: {e}, falling back to Telethon")
-            upload_success = False
-
-    if not upload_success:
-        try:
-            logger.info(f"Uploading with Telethon: {os.path.basename(file_path)} ({format_size(file_size)})")
+            logger.info("Uploading with persistent Telethon: %s (%s)",
+                        os.path.basename(file_path), format_size(file_size))
 
             def _telethon_progress(sent, total):
                 if progress_callback:
                     try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            loop.create_task(_safe_progress(progress_callback, sent, total))
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(_safe_progress(progress_callback, sent, total))
                     except Exception:
                         pass
 
@@ -181,72 +146,20 @@ async def fast_upload_file(file_path: str, caption: str, thumb_path: str = None,
                 timeout=TELETHON_TIMEOUT
             )
 
-            # Verify the Telegram document size before accepting the upload.
-            remote_size = None
-            try:
-                remote_size = getattr(getattr(msg, "document", None), "size", None)
-                if remote_size is None:
-                    remote_size = getattr(getattr(msg, "file", None), "size", None)
-            except Exception:
-                pass
-            if remote_size and remote_size < int(file_size * 0.98):
-                logger.error(
-                    f"Telethon upload incomplete: local={file_size} bytes, "
-                    f"telegram={remote_size} bytes. Deleting incomplete message."
-                )
-                try:
-                    await client.delete_messages(target_channel, msg.id)
-                except Exception as delete_error:
-                    logger.warning(f"Could not delete incomplete Telethon upload: {delete_error}")
-                raise RuntimeError(
-                    f"Incomplete Telegram upload ({remote_size}/{file_size} bytes)"
-                )
-
-            dump_msg_id = msg.id
-            upload_success = True
-            logger.info(
-                f"Upload completed using Telethon: msg_id={dump_msg_id} "
-                f"({format_size(remote_size or file_size)})"
-            )
+            logger.info("Upload completed with persistent Telethon: msg_id=%s", msg.id)
+            return msg.id
 
         except FloodWaitError as e:
-            logger.error(f"Flood wait during upload: {e.seconds} seconds")
-            await asyncio.sleep(e.seconds + 5)
-            try:
-                msg = await client.send_file(
-                    target_channel,
-                    file_path,
-                    caption=caption,
-                    thumb=thumb_path,
-                    force_document=True,
-                    part_size_kb=512,
-                    link_preview=False
-                )
-                remote_size = None
-                try:
-                    remote_size = getattr(getattr(msg, "document", None), "size", None)
-                    if remote_size is None:
-                        remote_size = getattr(getattr(msg, "file", None), "size", None)
-                except Exception:
-                    pass
-                if remote_size and remote_size < int(file_size * 0.98):
-                    try:
-                        await client.delete_messages(target_channel, msg.id)
-                    except Exception:
-                        pass
-                    raise RuntimeError(
-                        f"Incomplete Telegram upload on retry ({remote_size}/{file_size} bytes)"
-                    )
-                dump_msg_id = msg.id
-                upload_success = True
-            except Exception as retry_error:
-                logger.error(f"Upload retry failed: {retry_error}")
+            set_global_flood_wait(e.seconds)
+            logger.warning("Telegram FLOOD_WAIT during upload: %ss. Pausing all Telegram uploads.", e.seconds)
+            await wait_for_global_flood_wait()
+            return None
         except asyncio.TimeoutError:
-            logger.error(f"Telethon upload timed out after {TELETHON_TIMEOUT}s")
+            logger.error("Telethon upload timed out after %ss", TELETHON_TIMEOUT)
+            return None
         except Exception as e:
-            logger.error(f"Telethon upload failed: {e}")
-
-    return dump_msg_id if upload_success else None
+            logger.error("Telethon upload failed: %s", e)
+            return None
 
 
 async def _safe_progress(callback, current, total):
