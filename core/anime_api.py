@@ -234,6 +234,31 @@ def get_stream_links(anime_session: str, episode_session: str) -> Optional[List[
                     'text': text
                 })
         
+        # Direct-download (MP4) links: pahe.win -> kwik /f/ -> mp4. No HLS/m3u8.
+        direct = []
+        for a in (soup.select('#pickDownload a.dropdown-item[href]')
+                  or soup.select('a.dropdown-item[href*="pahe.win"]')):
+            href = a.get('href', '')
+            txt = a.get_text(' ', strip=True)
+            m = re.search(r'(\d{3,4})p', txt)
+            if not href or not m:
+                continue
+            direct.append({
+                'href': href,
+                'res': int(m.group(1)),
+                'audio': 'eng' if re.search(r'\beng\b', txt, re.I) else 'jpn',
+                'fansub': txt.split('\u00b7')[0].strip().lower(),
+            })
+        logger.info(f"Found {len(direct)} direct download links")
+
+        for s in stream_links:
+            s['embed_url'] = s['url']
+            cands = [d for d in direct if d['res'] == s['resolution'] and d['audio'] == s['audio']]
+            same = [d for d in cands if d['fansub'] == str(s['fansub']).strip().lower()]
+            pick = (same or cands or [None])[0]
+            if pick:
+                s['url'] = pick['href']
+
         if stream_links:
             logger.info(f"Found {len(stream_links)} stream links: {[(s['resolution'], s['audio']) for s in stream_links]}")
             return stream_links
@@ -268,131 +293,153 @@ def _unpack_js(p, a, c, k, e=None, d=None):
 
     return pattern.sub(replace, p)
 
+def _kwik_find(html: str, pattern: str) -> Optional[str]:
+    m = re.search(pattern, html)
+    if m:
+        return m.group(1)
+    for p, a_str, c_str, k_str in re.findall(
+        r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)",
+        html, re.DOTALL
+    ):
+        try:
+            decoded = _unpack_js(p, int(a_str), int(c_str), k_str.split('|'))
+            m = re.search(pattern, decoded)
+            if m:
+                return m.group(1)
+        except Exception:
+            continue
+    return None
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=3, max=8),
     reraise=True
 )
-def extract_m3u8_from_kwik(kwik_url: str) -> Optional[Dict[str, Any]]:
-    try:
-        parsed_url = urlparse(kwik_url)
-        kwik_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        animepahe_referer = "https://animepahe.pw/"
-        
-        headers = {
-            "Referer": animepahe_referer,
-            "User-Agent": KWIK_USER_AGENT
-        }
-        
-        logger.info(f"Extracting m3u8 from: {kwik_url}")
-        
-        # CHANGED: now goes through _new_scraper() so it also picks up
-        # ANIMEPAHE_PROXY if you set one.
-        session = _new_scraper()
-        session.headers.update(headers)
-        
-        response = session.get(kwik_url, timeout=30, allow_redirects=True)
-        response.raise_for_status()
-        
-        html_text = response.text
-        
-        m3u8_url = None
-        
-        all_packed = re.findall(
-            r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)",
-            html_text, re.DOTALL
-        )
-        
-        logger.info(f"Found {len(all_packed)} packed JS blocks in kwik page")
-        
-        for block_idx, (p, a_str, c_str, k_str) in enumerate(all_packed):
-            try:
-                a = int(a_str)
-                c = int(c_str)
-                k = k_str.split('|')
-                decoded = _unpack_js(p, a, c, k)
-                
-                if 'm3u8' not in decoded:
-                    logger.debug(f"Block {block_idx}: no m3u8 found, skipping")
-                    continue
-                
-                logger.info(f"Block {block_idx}: contains m3u8, searching for URL...")
-                
-                for pat in [
-                    r"const\s+source\s*=\s*'(https?://[^']+\.m3u8[^']*)'",
-                    r'const\s+source\s*=\s*"(https?://[^"]+\.m3u8[^"]*)"',
-                    r"source\s*=\s*'(https?://[^']+\.m3u8[^']*)'",
-                    r'source\s*=\s*"(https?://[^"]+\.m3u8[^"]*)"',
-                    r"file['\"]?\s*[:=]\s*['\"]?(https?://[^'\"]+\.m3u8[^'\"]*)",
-                    r"(https?://[^\s'\"\\)]+\.m3u8[^\s'\"\\)]*)",
-                ]:
-                    match = re.search(pat, decoded)
-                    if match and match.group(1):
-                        m3u8_url = match.group(1)
-                        logger.info(f"Found m3u8 URL in block {block_idx}")
-                        break
-                
-                if m3u8_url:
-                    break
-                    
-            except Exception as e:
-                logger.warning(f"Failed to unpack block {block_idx}: {e}")
-                continue
-        
-        if not m3u8_url:
-            for pat in [
-                r"source='(https?://[^']+\.m3u8[^']*)'",
-                r'source="(https?://[^"]+\.m3u8[^"]*)"',
-                r"(https?://[^\s'\"<>]+\.m3u8[^\s'\"<>]*)",
-            ]:
-                match = re.search(pat, html_text)
-                if match and match.group(1):
-                    m3u8_url = match.group(1)
-                    logger.info(f"Found m3u8 in raw HTML")
-                    break
-        
-        if not m3u8_url:
-            logger.error(f"Could not extract m3u8 URL from: {kwik_url}")
-            logger.debug(f"HTML sample: {html_text[:2000]}")
-            return None
-        
-        logger.info(f"Successfully extracted m3u8: {m3u8_url[:80]}...")
-        
-        kwik_referer = f"{kwik_domain}/"
-        return {
-            'm3u8_url': m3u8_url,
-            'headers': {
-                "Referer": kwik_referer,
-                "User-Agent": KWIK_USER_AGENT,
-            }
-        }
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout extracting m3u8 from: {kwik_url}")
-        raise
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error extracting m3u8: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error extracting m3u8 from {kwik_url}: {e}")
-        raise
+def extract_m3u8_from_kwik(link: str) -> Optional[Dict[str, Any]]:
+    """Resolve a pahe.win download link to a direct MP4 URL (no m3u8).
 
-async def download_m3u8(m3u8_url: str, headers: Dict[str, str], output_path: str, 
-                        progress_callback=None) -> bool:
-    import os
-    
-    from core.downloader import download_m3u8 as _robust_download_m3u8
-    
-    return await _robust_download_m3u8(
-        m3u8_url=m3u8_url,
-        output_path=output_path,
-        headers=headers,
-        cookies=None,
-        progress_callback=progress_callback,
-        progress_interval=3.0,
-        timeout=1800,
+    Name kept so existing callers in handlers.py / scheduler.py work
+    unchanged. Returns {'m3u8_url': <mp4 url>, 'headers': {...}}.
+    """
+    if 'pahe.win' not in link and '/f/' not in link:
+        logger.error(f"No direct download link (got embed link): {link}")
+        return None
+
+    session = _new_scraper()
+    session.headers.update({"User-Agent": KWIK_USER_AGENT})
+
+    kwik_f = link
+    if 'pahe.win' in link:
+        r = session.get(link, headers={"Referer": "https://animepahe.pw/"},
+                        timeout=30, allow_redirects=True)
+        r.raise_for_status()
+        kwik_f = _kwik_find(r.text, r"(https?://kwik\.[a-z]+/f/[A-Za-z0-9]+)")
+        if not kwik_f and '/f/' in r.url:
+            kwik_f = r.url
+        if not kwik_f:
+            logger.error(f"No kwik /f/ link found on pahe.win page (status {r.status_code})")
+            return None
+
+    kp = urlparse(kwik_f)
+    kwik_base = f"{kp.scheme}://{kp.netloc}"
+    page = session.get(kwik_f, headers={"Referer": link}, timeout=30, allow_redirects=True)
+    page.raise_for_status()
+
+    token = _kwik_find(page.text, r'name="_token"\s+value="([^"]+)"')
+    action = _kwik_find(page.text, r'<form[^>]+action="([^"]+)"') or _kwik_find(
+        page.text, r"(https?://kwik\.[a-z]+/d/[A-Za-z0-9]+)")
+    if not token or not action:
+        logger.error("kwik /f/ page: token or form action not found")
+        return None
+    if action.startswith('/'):
+        action = kwik_base + action
+
+    resp = session.post(
+        action, data={"_token": token},
+        headers={"Referer": kwik_f, "Origin": kwik_base,
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        allow_redirects=False, timeout=30,
     )
+    mp4 = resp.headers.get("location")
+    if not mp4:
+        logger.error(f"kwik POST returned {resp.status_code} with no redirect")
+        return None
+
+    logger.info(f"Resolved direct MP4: {mp4[:80]}...")
+    return {
+        'm3u8_url': mp4,   # key name kept for compatibility; this is an MP4 URL
+        'headers': {"Referer": f"{kwik_base}/", "User-Agent": KWIK_USER_AGENT},
+    }
+
+
+def _direct_download_sync(url, headers, output_path, state):
+    session = _new_scraper()
+    with session.get(url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        state['total'] = int(r.headers.get('content-length', 0) or 0)
+        with open(output_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024 * 512):
+                if chunk:
+                    f.write(chunk)
+                    state['done'] += len(chunk)
+    state['finished'] = True
+
+
+async def download_m3u8(m3u8_url: str, headers: Dict[str, str], output_path: str,
+                        progress_callback=None) -> bool:
+    """Direct MP4 download (name kept for compatibility; no m3u8/ffmpeg)."""
+    from core.downloader import DownloadProgress
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    state = {'done': 0, 'total': 0, 'finished': False}
+    start = time.time()
+    task = asyncio.create_task(asyncio.to_thread(
+        _direct_download_sync, m3u8_url, headers, output_path, state))
+
+    prog = DownloadProgress(status="downloading")
+    last_bytes, last_ts = 0, start
+    while not task.done():
+        await asyncio.sleep(3)
+        now = time.time()
+        prog.downloaded_bytes = state['done']
+        prog.total_bytes = state['total']
+        prog.speed_bps = (state['done'] - last_bytes) / max(now - last_ts, 0.001)
+        prog.elapsed = now - start
+        if state['total'] and prog.speed_bps > 0:
+            prog.eta = (state['total'] - state['done']) / prog.speed_bps
+        last_bytes, last_ts = state['done'], now
+        if progress_callback:
+            try:
+                await progress_callback(prog)
+            except Exception:
+                pass
+
+    try:
+        await task
+    except Exception as e:
+        logger.error(f"Direct download failed: {e}")
+        prog.status = "failed"
+        if progress_callback:
+            try:
+                await progress_callback(prog)
+            except Exception:
+                pass
+        return False
+
+    ok = os.path.exists(output_path) and os.path.getsize(output_path) > 1000
+    prog.status = "done" if ok else "failed"
+    prog.downloaded_bytes = prog.total_bytes = state['done']
+    prog.elapsed = time.time() - start
+    if progress_callback:
+        try:
+            await progress_callback(prog)
+        except Exception:
+            pass
+    return ok
 
 def map_resolution_to_quality_tier(resolution: int) -> str:
     if resolution <= 360:
