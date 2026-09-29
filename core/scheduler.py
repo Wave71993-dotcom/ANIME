@@ -29,7 +29,7 @@ from core.anime_api import (
     search_anime, get_all_episodes, get_latest_releases,
     get_stream_links, extract_m3u8_from_kwik, download_m3u8,
     get_quality_streams, detect_audio_type, get_anime_info,
-    find_closest_episode, map_resolution_to_quality_tier
+    find_closest_episode, map_resolution_to_quality_tier, download_anime_poster
 )
 from core.download import (
     rename_video_with_ffmpeg, robust_upload_file
@@ -218,43 +218,63 @@ async def _get_anime_thumb_path(client, anime_title):
         logger.warning("Could not prepare anime thumb: %s", exc)
     return await get_fixed_thumbnail()
 
-async def _get_anime_poster_media(client, anime_title, anime_info=None):
-    """Owner poster first; otherwise use the bot's previous default AniList poster."""
+
+
+async def _get_default_poster_path(anime_title, anime_info, suffix=""):
+    """Get the bot's original/default anime poster when no custom poster is set.
+
+    Preserve the old img.anili.st poster first, then use AniList cover/banner
+    fallbacks so a missing custom poster never silently removes the poster.
+    """
+    safe = sanitize_filename(anime_title)
+    path = os.path.join(DOWNLOAD_DIR, f"poster_{safe}{suffix}.jpg")
+
+    candidates = []
+    ani_id = anime_info.get("id") if anime_info else None
+    if ani_id:
+        # This was the original poster source used by the bot.
+        candidates.append(f"https://img.anili.st/media/{ani_id}")
+
+    if anime_info:
+        cover = anime_info.get("coverImage") or {}
+        if isinstance(cover, dict):
+            candidates.extend([cover.get("extraLarge"), cover.get("large"), cover.get("medium")])
+        elif isinstance(cover, str):
+            candidates.append(cover)
+        candidates.append(anime_info.get("bannerImage"))
+
+    for url in candidates:
+        if not url:
+            continue
+        try:
+            result = await _download_saved_media_url(url, path)
+            if result and os.path.exists(result) and os.path.getsize(result) > 1000:
+                logger.info("Using default anime poster for %s: %s", anime_title, url)
+                return result
+        except Exception as exc:
+            logger.warning("Default poster source failed for %s: %s", anime_title, exc)
+
+    # Final fallback uses the existing AniList poster downloader/cache.
+    try:
+        result = await download_anime_poster(anime_title, save_dir=DOWNLOAD_DIR)
+        if result and os.path.exists(result) and os.path.getsize(result) > 1000:
+            logger.info("Using AniList fallback poster for %s", anime_title)
+            return result
+    except Exception as exc:
+        logger.warning("AniList fallback poster failed for %s: %s", anime_title, exc)
+
+    return None
+
+async def _get_anime_poster_media(client, anime_title):
     media_map = bot_settings.get("anime_posters", {}) or {}
     ref = media_map.get(anime_title)
     if ref:
-        try:
-            if ref.get("url"):
-                path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}.jpg")
-                result = await _download_saved_media_url(ref["url"], path)
-                if result and os.path.exists(result) and os.path.getsize(result) > 1000:
-                    return result
-            msg = await _get_saved_media_message(client, anime_title, "poster")
-            if msg and msg.media:
-                return msg.media
-        except Exception as exc:
-            logger.warning("Owner poster failed for %s; using default poster: %s", anime_title, exc)
-
-    try:
-        info = anime_info or {}
-        cover = info.get("coverImage") or {}
-        if isinstance(cover, dict):
-            image_url = cover.get("extraLarge") or cover.get("large") or cover.get("medium")
-        else:
-            image_url = cover if isinstance(cover, str) else None
-        if not image_url and info.get("id"):
-            image_url = f"https://img.anili.st/media/{info['id']}"
-        if not image_url:
-            image_url = await _get_best_image(info)
-            if isinstance(image_url, dict):
-                image_url = image_url.get("extraLarge") or image_url.get("large") or image_url.get("medium")
-        if image_url:
+        if ref.get("url"):
             path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}.jpg")
-            result = await _download_saved_media_url(image_url, path)
-            if result and os.path.exists(result) and os.path.getsize(result) > 1000:
-                return result
-    except Exception as exc:
-        logger.warning("Could not prepare default poster for %s: %s", anime_title, exc)
+            return await _download_saved_media_url(ref["url"], path)
+        msg = await _get_saved_media_message(client, anime_title, "poster")
+        if msg and msg.media:
+            return msg.media
     return None
 
 async def _send_anime_sticker(client, target, anime_title):
@@ -367,11 +387,17 @@ async def post_anime_with_buttons(client, anime_title, anime_info, episode_numbe
         except Exception: layout = 2
         buttons = _arrange_buttons(button_list, layout)
 
-        poster_media = await _get_anime_poster_media(client, anime_title, anime_info)
+        poster_media = await _get_anime_poster_media(client, anime_title)
         if poster_media:
             await client.send_file(channel_target, poster_media, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
         else:
-            await client.send_message(channel_target, caption, parse_mode='html', buttons=buttons, link_preview=False)
+            poster_path = await _get_default_poster_path(anime_title, anime_info)
+            if poster_path and os.path.exists(poster_path):
+                await client.send_file(channel_target, poster_path, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
+                try: os.remove(poster_path)
+                except: pass
+            else:
+                await client.send_message(channel_target, caption, parse_mode='html', buttons=buttons, link_preview=False)
         await _send_anime_sticker(client, channel_target, anime_title)
         logger.info(f"Posted {anime_title} Episode {episode_number} to channel with {len(button_list)} buttons")
 
@@ -455,11 +481,17 @@ async def post_anime_batch_with_buttons(client, anime_title, anime_info, quality
         try: layout = int(fmt.get('button_layout', 2))
         except Exception: layout = 2
         buttons = _arrange_buttons(button_list, layout)
-        poster_media = await _get_anime_poster_media(client, anime_title, anime_info)
+        poster_media = await _get_anime_poster_media(client, anime_title)
         if poster_media:
             await client.send_file(channel_target, poster_media, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
         else:
-            await client.send_message(channel_target, caption, parse_mode='html', buttons=buttons, link_preview=False)
+            poster_path = await _get_default_poster_path(anime_title, anime_info, suffix="_batch")
+            if poster_path and os.path.exists(poster_path):
+                await client.send_file(channel_target, poster_path, caption=caption, parse_mode='html', buttons=buttons, link_preview=False)
+                try: os.remove(poster_path)
+                except: pass
+            else:
+                await client.send_message(channel_target, caption, parse_mode='html', buttons=buttons, link_preview=False)
         await _send_anime_sticker(client, channel_target, anime_title)
         logger.info(f"Posted batch: {anime_title} ({total_episodes} episodes) to channel")
 
