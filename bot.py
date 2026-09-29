@@ -83,34 +83,42 @@ async def _health_monitor_loop():
         await asyncio.sleep(60)
 
 async def main():
-    try:
-        await start_web_server()
-        
-        register_handlers()
-        
-        await client.start(bot_token=BOT_TOKEN)
-        logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜.")
-        await asyncio.sleep(1)
-        logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜..")
-        await asyncio.sleep(1.5)
-        logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜...")
-        
-        setup_scheduler(client)
-        
-        asyncio.create_task(_health_monitor_loop())
-        
-        await asyncio.sleep(3)
-        logger.info("𝘼𝙪𝙩𝙤𝘼𝙣𝙞𝙢𝙚 𝙞𝙨 𝘼𝙇𝙄𝙑𝙀!")
-        
-        start_pic_path = download_start_pic_if_not_exists(START_PIC_URL)
-        await get_fixed_thumbnail()
+    # HTTP server is started exactly once. Telegram reconnects never restart it.
+    await start_web_server()
+    register_handlers()
+    asyncio.create_task(_health_monitor_loop())
+    scheduler_started = False
 
-        await client.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"𝙀𝙧𝙧𝙤𝙧: {e}")
-        logger.info("𝙍𝙚:𝙎𝙩𝙖𝙧𝙩𝙞𝙣𝙜")
-        await asyncio.sleep(15)
-        await main()
+    while True:
+        try:
+            if not client.is_connected():
+                await client.start(bot_token=BOT_TOKEN)
+            logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜.")
+            await asyncio.sleep(1)
+            logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜..")
+            await asyncio.sleep(1.5)
+            logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜...")
+            if not scheduler_started:
+                setup_scheduler(client)
+                scheduler_started = True
+            await asyncio.sleep(3)
+            logger.info("𝘼𝙪𝙩𝙤𝘼𝙣𝙞𝙢𝙚 𝙞𝙨 𝘼𝙇𝙄𝙑𝙀!")
+            download_start_pic_if_not_exists(START_PIC_URL)
+            await get_fixed_thumbnail()
+            await client.run_until_disconnected()
+            break
+        except Exception as e:
+            seconds = getattr(e, 'seconds', None)
+            if seconds is not None:
+                wait = max(int(seconds) + 5, 5)
+                logger.error(f"Telegram flood wait: waiting {wait}s: {e}")
+                await asyncio.sleep(wait)
+                continue
+            logger.error(f"𝙀𝙧𝙧𝙤𝙧: {e}")
+            await asyncio.sleep(15)
+            if client.is_connected():
+                try: await client.disconnect()
+                except Exception: pass
 
 if __name__ == '__main__':
     asyncio.run(main())
