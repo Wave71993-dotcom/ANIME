@@ -16,7 +16,7 @@ from core.config import (
 )
 from core.client import client, FFMPEG_AVAILABLE, currently_processing
 from core.state import (
-    auto_download_state, quality_settings, anime_queue,
+    auto_download_state, quality_settings, anime_queue, bot_settings,
     episode_tracker, EpisodeState, deferred_episodes
 )
 from core.utils import (
