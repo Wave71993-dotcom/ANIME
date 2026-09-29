@@ -79,7 +79,31 @@ async def _upload_via_pyrogram(file_path, caption, thumb_path, target_channel,
             timeout=timeout,
         )
 
-        logger.info(f"Fast upload completed using Pyrogram: msg_id={pyro_msg.id}")
+        # Verify Telegram received the complete file. A successful API call
+        # is not enough for our pipeline because an incomplete upload must
+        # never be used to generate download links.
+        remote_size = None
+        try:
+            remote_size = getattr(getattr(pyro_msg, "document", None), "file_size", None)
+            if remote_size is None:
+                remote_size = getattr(getattr(pyro_msg, "video", None), "file_size", None)
+        except Exception:
+            pass
+        if remote_size and remote_size < int(file_size * 0.98):
+            logger.error(
+                f"Pyrogram upload incomplete: local={file_size} bytes, "
+                f"telegram={remote_size} bytes. Deleting incomplete message."
+            )
+            try:
+                await pyro.delete_messages(target_channel, pyro_msg.id)
+            except Exception as delete_error:
+                logger.warning(f"Could not delete incomplete Pyrogram upload: {delete_error}")
+            return None
+
+        logger.info(
+            f"Fast upload completed using Pyrogram: msg_id={pyro_msg.id} "
+            f"({format_size(remote_size or file_size)})"
+        )
         return pyro_msg.id
 
     finally:
@@ -157,9 +181,33 @@ async def fast_upload_file(file_path: str, caption: str, thumb_path: str = None,
                 timeout=TELETHON_TIMEOUT
             )
 
+            # Verify the Telegram document size before accepting the upload.
+            remote_size = None
+            try:
+                remote_size = getattr(getattr(msg, "document", None), "size", None)
+                if remote_size is None:
+                    remote_size = getattr(getattr(msg, "file", None), "size", None)
+            except Exception:
+                pass
+            if remote_size and remote_size < int(file_size * 0.98):
+                logger.error(
+                    f"Telethon upload incomplete: local={file_size} bytes, "
+                    f"telegram={remote_size} bytes. Deleting incomplete message."
+                )
+                try:
+                    await client.delete_messages(target_channel, msg.id)
+                except Exception as delete_error:
+                    logger.warning(f"Could not delete incomplete Telethon upload: {delete_error}")
+                raise RuntimeError(
+                    f"Incomplete Telegram upload ({remote_size}/{file_size} bytes)"
+                )
+
             dump_msg_id = msg.id
             upload_success = True
-            logger.info(f"Upload completed using Telethon: msg_id={dump_msg_id}")
+            logger.info(
+                f"Upload completed using Telethon: msg_id={dump_msg_id} "
+                f"({format_size(remote_size or file_size)})"
+            )
 
         except FloodWaitError as e:
             logger.error(f"Flood wait during upload: {e.seconds} seconds")
@@ -174,6 +222,21 @@ async def fast_upload_file(file_path: str, caption: str, thumb_path: str = None,
                     part_size_kb=512,
                     link_preview=False
                 )
+                remote_size = None
+                try:
+                    remote_size = getattr(getattr(msg, "document", None), "size", None)
+                    if remote_size is None:
+                        remote_size = getattr(getattr(msg, "file", None), "size", None)
+                except Exception:
+                    pass
+                if remote_size and remote_size < int(file_size * 0.98):
+                    try:
+                        await client.delete_messages(target_channel, msg.id)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Incomplete Telegram upload on retry ({remote_size}/{file_size} bytes)"
+                    )
                 dump_msg_id = msg.id
                 upload_success = True
             except Exception as retry_error:
