@@ -193,8 +193,38 @@ async def download_m3u8(
                 local_seg = os.path.join(local_segments_dir, seg_filename)
 
                 logger.debug("Downloading segment %d/%d: %s", segment_count, total_segments, seg_filename)
-                seg_resp = scraper.get(seg_url, headers=req_headers, timeout=60)
-                seg_resp.raise_for_status()
+                seg_resp = None
+                last_seg_error = None
+                for attempt in range(4):
+                    try:
+                        seg_resp = scraper.get(seg_url, headers=req_headers, timeout=60)
+                        if seg_resp.status_code == 429:
+                            retry_after = seg_resp.headers.get("Retry-After")
+                            try:
+                                delay = min(max(float(retry_after), 1.0), 15.0) if retry_after else 2.0 * (attempt + 1)
+                            except (TypeError, ValueError):
+                                delay = 2.0 * (attempt + 1)
+                            logger.warning("HLS segment rate-limited (429), retry %d/4 in %.1fs: %s", attempt + 1, delay, seg_url[:120])
+                            time.sleep(delay)
+                            continue
+                        seg_resp.raise_for_status()
+                        break
+                    except Exception as exc:
+                        last_seg_error = exc
+                        if attempt < 3:
+                            time.sleep(1.5 * (attempt + 1))
+                        else:
+                            raise
+
+                if seg_resp is None:
+                    raise last_seg_error or RuntimeError("Failed to download HLS segment")
+
+                # Hiyori/Miruro sometimes uses .jpg/.txt names for actual
+                # MPEG-TS/fMP4 media. Keep the original playlist URL semantics
+                # but use a media-safe local filename so FFmpeg can probe it.
+                safe_ext = os.path.splitext(seg_filename)[1].lower()
+                if safe_ext not in {".ts", ".m4s", ".mp4", ".aac", ".m4a", ".mp3", ".webvtt", ".vtt"}:
+                    local_seg = os.path.join(local_segments_dir, f"seg-{segment_count:06d}.ts")
 
                 with open(local_seg, "wb") as f:
                     f.write(seg_resp.content)
@@ -252,6 +282,7 @@ async def download_m3u8(
     cmd.extend([
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
         "-allowed_extensions", "ALL",
+        "-extension_picky", "0",
         "-i", actual_input,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",

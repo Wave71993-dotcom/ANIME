@@ -134,12 +134,56 @@ query ($id: Int) {
     cover_data = anime_info.get('coverImage', {})
     return cover_data.get('extraLarge') or cover_data.get('large')
 
+async def _resolve_channel_target(client, channel_id, channel_username):
+    """Resolve a Telethon channel to an entity with a valid access hash.
+
+    A raw numeric channel ID is not enough for Telethon when the entity is
+    absent from the session cache. Prefer username, otherwise search dialogs.
+    """
+    if channel_username:
+        username = str(channel_username).lstrip("@")
+        try:
+            return await client.get_entity(username)
+        except Exception as exc:
+            logger.warning("Could not resolve channel username @%s: %s", username, exc)
+
+    if channel_id:
+        try:
+            wanted = int(channel_id)
+        except (TypeError, ValueError):
+            wanted = None
+
+        if wanted is not None:
+            # Telethon IDs may appear signed/unsigned depending on how they
+            # were stored, so compare the absolute channel ID as well.
+            wanted_abs = abs(wanted)
+            try:
+                async for dialog in client.iter_dialogs():
+                    entity = dialog.entity
+                    entity_id = getattr(entity, "id", None)
+                    if entity_id is not None and (int(entity_id) == wanted_abs or abs(int(entity_id)) == wanted_abs):
+                        return entity
+            except Exception as exc:
+                logger.warning("Could not search Telegram dialogs for channel %s: %s", wanted, exc)
+
+            try:
+                return await client.get_entity(wanted)
+            except Exception as exc:
+                logger.error(
+                    "Could not resolve channel ID %s. Set CHANNEL_USERNAME to the channel username "
+                    "or make sure the channel is present in the Telethon account's dialogs: %s",
+                    wanted, exc
+                )
+
+    return None
+
+
 async def post_anime_with_buttons(client, anime_title, anime_info, episode_number, audio_type, quality_files):
     from core.config import CHANNEL_ID, CHANNEL_USERNAME, FIXED_THUMBNAIL_URL
 
-    channel_target = CHANNEL_ID or CHANNEL_USERNAME
+    channel_target = await _resolve_channel_target(client, CHANNEL_ID, CHANNEL_USERNAME)
     if not channel_target:
-        logger.warning("No main channel configured for posting")
+        logger.warning("No resolvable main channel configured for posting")
         return
 
     channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
@@ -279,9 +323,9 @@ def _arrange_buttons(button_list):
 async def post_anime_batch_with_buttons(client, anime_title, anime_info, quality_files, total_episodes, audio_type):
     from core.config import CHANNEL_ID, CHANNEL_USERNAME
 
-    channel_target = CHANNEL_ID or CHANNEL_USERNAME
+    channel_target = await _resolve_channel_target(client, CHANNEL_ID, CHANNEL_USERNAME)
     if not channel_target:
-        logger.warning("No main channel configured for posting")
+        logger.warning("No resolvable main channel configured for posting")
         return
 
     channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
